@@ -1,0 +1,184 @@
+# action.yml
+name: 'Codacy Coverage Reporter'
+description: 'Multi-language coverage reporter for Codacy'
+branding:
+  icon: 'check'
+  color: 'gray-dark'
+inputs:
+  project-token:
+    required: false
+    description: "API project token to authenticate on the Codacy API while uploading the coverage data"
+  api-token:
+    required: false
+    description: "API account token to authenticate on the Codacy API while uploading the coverage data"
+  coverage-reports:
+    description: 'Optional comma separated list of coverage reports to send to Codacy'
+    required: false
+    default: ''
+  language:
+    description: 'Optionally force associating a language with your coverage report'
+    required: false
+  force-coverage-parser:
+    description: 'Optionally force using a specific coverage report parser'
+    required: false
+  coverage-reporter-version:
+    description: 'Optionally force using a specific coverage reporter version'
+    required: false
+runs:
+  using: "composite"
+  steps:
+    - name: Subscription check
+      env:
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+      run: |
+        # validate subscription status
+        UPSTREAM="codacy/codacy-coverage-reporter-action"
+        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-}"
+        DOCS_URL="https://docs.stepsecurity.io/actions/stepsecurity-maintained-actions"
+
+        echo ""
+        echo -e "\033[1;36mStepSecurity Maintained Action\033[0m"
+        echo "Secure drop-in replacement for $UPSTREAM"
+        if [ "$REPO_PRIVATE" = "false" ]; then
+          echo -e "\033[32m✓ Free for public repositories\033[0m"
+        fi
+        echo -e "\033[36mLearn more:\033[0m $DOCS_URL"
+        echo ""
+
+        if [ "$REPO_PRIVATE" != "false" ]; then
+          SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+
+          if [ "$SERVER_URL" != "https://github.com" ]; then
+            BODY=$(printf '{"action":"%s","ghes_server":"%s"}' "$ACTION_REPO" "$SERVER_URL")
+          else
+            BODY=$(printf '{"action":"%s"}' "$ACTION_REPO")
+          fi
+
+          API_URL="https://agent.api.stepsecurity.io/v1/github/$GITHUB_REPOSITORY/actions/maintained-actions-subscription"
+
+          RESPONSE=$(curl --max-time 3 -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "$API_URL" -o /dev/null) && CURL_EXIT_CODE=0 || CURL_EXIT_CODE=$?
+
+          if [ $CURL_EXIT_CODE -ne 0 ]; then
+            echo "Timeout or API not reachable. Continuing to next step."
+          elif [ "$RESPONSE" = "403" ]; then
+            echo -e "::error::\033[1;31mThis action requires a StepSecurity subscription for private repositories.\033[0m"
+            echo -e "::error::\033[31mLearn how to enable a subscription: $DOCS_URL\033[0m"
+            exit 1
+          fi
+        fi
+      shell: bash
+    - name: "Set Repository Variables"
+      shell: bash
+      run: |
+        echo "ORGANIZATION_PROVIDER=$(if [[ $GITHUB_SERVER_URL == "https://github.com" ]]; then echo "gh"; else echo "ghe"; fi)" >> $GITHUB_ENV
+        echo "OWNER_NAME=$(echo $GITHUB_REPOSITORY | cut -d '/' -f 1)" >> $GITHUB_ENV
+        echo "REPOSITORY_NAME=$(echo $GITHUB_REPOSITORY | cut -d '/' -f 2)" >> $GITHUB_ENV
+        if [ -n "${{ inputs.coverage-reporter-version }}" ]; then
+          printf 'CODACY_REPORTER_VERSION=%s\n' "${{ inputs.coverage-reporter-version }}" >> $GITHUB_ENV
+        fi
+
+    - name: "Run coverage-reporter"
+      shell: bash
+      run: |
+        echo "Welcome to Coverage-Reporter-Action"
+
+        set -eu
+
+        if [ -n "${{ inputs.api-token }}" ]; then
+          echo "::add-mask::${{ inputs.api-token }}"
+        fi
+        if [ -n "${{ inputs.project-token }}" ]; then
+          echo "::add-mask::${{ inputs.project-token }}"
+        fi
+
+        set -x
+
+        declare -a params
+        if [ -n "${{ inputs.coverage-reports }}" ]; then
+          IFS=',' read -ra reports <<< "${{ inputs.coverage-reports }}"
+          for report in "${reports[@]}"; do
+            report=$(echo "$report" | xargs)
+            if [ -n "$report" ]; then
+              params+=("-r" "$report")
+            fi
+          done
+        fi
+
+        # Build auth parameters
+        auth=''
+        if [ -n "${{ inputs.api-token }}" ]; then auth="--api-token ${{ inputs.api-token }} --organization-provider $ORGANIZATION_PROVIDER --username $OWNER_NAME --project-name $REPOSITORY_NAME"; fi
+        if [ -n "${{ inputs.project-token }}" ]; then auth="--project-token ${{ inputs.project-token }}"; fi
+
+        declare -a force_parser
+        if [ -n "${{ inputs.force-coverage-parser }}" ]; then
+          force_parser+=("--force-coverage-parser" "${{ inputs.force-coverage-parser }}")
+        fi
+
+        declare -a lang
+        if [ -n "${{ inputs.language }}" ]; then
+          lang+=("--language" "${{ inputs.language }}")
+        fi
+
+        # Determine OS and architecture
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        case "$OS" in
+          linux) BINARY_NAME="codacy-coverage-reporter-linux" ;;
+          darwin) BINARY_NAME="codacy-coverage-reporter-darwin" ;;
+          mingw*|msys*|cygwin*) BINARY_NAME="codacy-coverage-reporter-win.exe" ;;
+          *) echo "Unsupported OS: $OS"; exit 1 ;;
+        esac
+
+        # Use pinned version or fetch latest from GitHub
+        VERSION="${CODACY_REPORTER_VERSION:-}"
+        USE_SECURE_DOWNLOAD=true
+
+        if [ -z "$VERSION" ]; then
+          echo "Attempting to fetch latest codacy-coverage-reporter version..."
+          VERSION=$(curl -fsSL https://api.github.com/repos/codacy/codacy-coverage-reporter/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+          if [ -z "$VERSION" ]; then
+            echo "⚠️  WARNING: Could not determine version from GitHub, falling back to get.sh method"
+            USE_SECURE_DOWNLOAD=false
+          else
+            echo "Using latest version: $VERSION"
+          fi
+        fi
+
+        if [ "$USE_SECURE_DOWNLOAD" = true ]; then
+          # Download binary and checksum from GitHub Releases (secure method)
+          CACHE_DIR="${HOME}/.cache/codacy"
+          mkdir -p "$CACHE_DIR"
+          BINARY_PATH="$CACHE_DIR/$BINARY_NAME"
+          CHECKSUM_PATH="$CACHE_DIR/$BINARY_NAME.SHA512SUM"
+
+          GITHUB_RELEASE_URL="https://github.com/codacy/codacy-coverage-reporter/releases/download/$VERSION"
+
+          echo "Downloading codacy-coverage-reporter v$VERSION..."
+          curl -fsSL -o "$BINARY_PATH" "$GITHUB_RELEASE_URL/$BINARY_NAME"
+          curl -fsSL -o "$CHECKSUM_PATH" "$GITHUB_RELEASE_URL/$BINARY_NAME.SHA512SUM"
+
+          # Verify checksum
+          echo "Verifying checksum..."
+          cd "$CACHE_DIR"
+          sha512sum -c "$BINARY_NAME.SHA512SUM"
+          cd - > /dev/null
+
+          # Make binary executable
+          chmod +x "$BINARY_PATH"
+
+          # Run coverage reporter
+          set +x
+          "$BINARY_PATH" report "${lang[@]}" "${force_parser[@]}" $auth "${params[@]}" --partial && \
+          "$BINARY_PATH" final $auth
+          set -x
+        else
+          # Fallback to get.sh method (less secure but still works)
+          echo "Continuing with traditional get.sh method..."
+          set +x
+          bash <(curl -fs https://coverage.codacy.com/get.sh) report "${lang[@]}" "${force_parser[@]}" $auth "${params[@]}" --partial && \
+          bash <(curl -fs https://coverage.codacy.com/get.sh) final $auth
+          set -x
+        fi
