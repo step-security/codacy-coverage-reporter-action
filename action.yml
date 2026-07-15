@@ -77,35 +77,108 @@ runs:
         echo "ORGANIZATION_PROVIDER=$(if [[ $GITHUB_SERVER_URL == "https://github.com" ]]; then echo "gh"; else echo "ghe"; fi)" >> $GITHUB_ENV
         echo "OWNER_NAME=$(echo $GITHUB_REPOSITORY | cut -d '/' -f 1)" >> $GITHUB_ENV
         echo "REPOSITORY_NAME=$(echo $GITHUB_REPOSITORY | cut -d '/' -f 2)" >> $GITHUB_ENV
-        echo "CODACY_REPORTER_VERSION=$(if [ -n "${{ inputs.coverage-reporter-version }}" ]; then echo "${{ inputs.coverage-reporter-version }}"; fi)" >> $GITHUB_ENV
+        if [ -n "${{ inputs.coverage-reporter-version }}" ]; then
+          printf 'CODACY_REPORTER_VERSION=%s\n' "${{ inputs.coverage-reporter-version }}" >> $GITHUB_ENV
+        fi
 
     - name: "Run coverage-reporter"
       shell: bash
       run: |
         echo "Welcome to Coverage-Reporter-Action"
-        
-        set -eux
 
-        report_list=''
-        # comma separated list of report files
-        if [ -n "${{ inputs.coverage-reports }}" ]; then report_list="${{ inputs.coverage-reports }}"; fi
+        set -eu
 
-        IFS=','
-        report_array=$report_list
-        params=''
-        for report in $report_array
-        do
-            if [ ! -z "$report" ]
-            then
-                params="$params -r $report"
+        if [ -n "${{ inputs.api-token }}" ]; then
+          echo "::add-mask::${{ inputs.api-token }}"
+        fi
+        if [ -n "${{ inputs.project-token }}" ]; then
+          echo "::add-mask::${{ inputs.project-token }}"
+        fi
+
+        set -x
+
+        declare -a params
+        if [ -n "${{ inputs.coverage-reports }}" ]; then
+          IFS=',' read -ra reports <<< "${{ inputs.coverage-reports }}"
+          for report in "${reports[@]}"; do
+            report=$(echo "$report" | xargs)
+            if [ -n "$report" ]; then
+              params+=("-r" "$report")
             fi
-        done
+          done
+        fi
 
+        # Build auth parameters
         auth=''
         if [ -n "${{ inputs.api-token }}" ]; then auth="--api-token ${{ inputs.api-token }} --organization-provider $ORGANIZATION_PROVIDER --username $OWNER_NAME --project-name $REPOSITORY_NAME"; fi
         if [ -n "${{ inputs.project-token }}" ]; then auth="--project-token ${{ inputs.project-token }}"; fi
-        if [ -n "${{ inputs.force-coverage-parser }}" ]; then force_parser="--force-coverage-parser ${{ inputs.force-coverage-parser }}"; else force_parser=""; fi
-        if [ -n "${{ inputs.language }}" ]; then lang="--language ${{ inputs.language }}"; else lang=""; fi
 
-        bash <(curl -Ls https://coverage.codacy.com/get.sh) report $lang $force_parser $auth $params --partial &&\
-        bash <(curl -Ls https://coverage.codacy.com/get.sh) final $auth
+        declare -a force_parser
+        if [ -n "${{ inputs.force-coverage-parser }}" ]; then
+          force_parser+=("--force-coverage-parser" "${{ inputs.force-coverage-parser }}")
+        fi
+
+        declare -a lang
+        if [ -n "${{ inputs.language }}" ]; then
+          lang+=("--language" "${{ inputs.language }}")
+        fi
+
+        # Determine OS and architecture
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        case "$OS" in
+          linux) BINARY_NAME="codacy-coverage-reporter-linux" ;;
+          darwin) BINARY_NAME="codacy-coverage-reporter-darwin" ;;
+          mingw*|msys*|cygwin*) BINARY_NAME="codacy-coverage-reporter-win.exe" ;;
+          *) echo "Unsupported OS: $OS"; exit 1 ;;
+        esac
+
+        # Use pinned version or fetch latest from GitHub
+        VERSION="${CODACY_REPORTER_VERSION:-}"
+        USE_SECURE_DOWNLOAD=true
+
+        if [ -z "$VERSION" ]; then
+          echo "Attempting to fetch latest codacy-coverage-reporter version..."
+          VERSION=$(curl -fsSL https://api.github.com/repos/codacy/codacy-coverage-reporter/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+          if [ -z "$VERSION" ]; then
+            echo "⚠️  WARNING: Could not determine version from GitHub, falling back to get.sh method"
+            USE_SECURE_DOWNLOAD=false
+          else
+            echo "Using latest version: $VERSION"
+          fi
+        fi
+
+        if [ "$USE_SECURE_DOWNLOAD" = true ]; then
+          # Download binary and checksum from GitHub Releases (secure method)
+          CACHE_DIR="${HOME}/.cache/codacy"
+          mkdir -p "$CACHE_DIR"
+          BINARY_PATH="$CACHE_DIR/$BINARY_NAME"
+          CHECKSUM_PATH="$CACHE_DIR/$BINARY_NAME.SHA512SUM"
+
+          GITHUB_RELEASE_URL="https://github.com/codacy/codacy-coverage-reporter/releases/download/$VERSION"
+
+          echo "Downloading codacy-coverage-reporter v$VERSION..."
+          curl -fsSL -o "$BINARY_PATH" "$GITHUB_RELEASE_URL/$BINARY_NAME"
+          curl -fsSL -o "$CHECKSUM_PATH" "$GITHUB_RELEASE_URL/$BINARY_NAME.SHA512SUM"
+
+          # Verify checksum
+          echo "Verifying checksum..."
+          cd "$CACHE_DIR"
+          sha512sum -c "$BINARY_NAME.SHA512SUM"
+          cd - > /dev/null
+
+          # Make binary executable
+          chmod +x "$BINARY_PATH"
+
+          # Run coverage reporter
+          set +x
+          "$BINARY_PATH" report "${lang[@]}" "${force_parser[@]}" $auth "${params[@]}" --partial && \
+          "$BINARY_PATH" final $auth
+          set -x
+        else
+          # Fallback to get.sh method (less secure but still works)
+          echo "Continuing with traditional get.sh method..."
+          set +x
+          bash <(curl -fs https://coverage.codacy.com/get.sh) report "${lang[@]}" "${force_parser[@]}" $auth "${params[@]}" --partial && \
+          bash <(curl -fs https://coverage.codacy.com/get.sh) final $auth
+          set -x
+        fi
